@@ -37,27 +37,21 @@ C -- 否 --> PS
 S2 --> PS["后续策略：版权干预→监控"]
 </div>
 
-<h2>3. 四个方案</h2>
-<div class="card"><h3>方案一 外流（已有做法）：C++ 因子 + DSL 拼装 + F1 公式</h3>
+<h2>3. 三个方案</h2>
+<div class="card"><h3>方案一 外流小算子：C++ 因子 + DSL 拼装 + F1 公式</h3>
 <div class="mermaid">flowchart LR
 A["5000行 finalscore"] --> B["多个 C++ 因子（admit/compute，可嵌套 factor udf）<br/>零散配置"] --> C["DSL 小算子拼大算子<br/>零散配置"] --> D["F1 最终公式（配置化）"]</div>
 <p><b>加一个因子要改：</b>C++ 因子 + DSL + 公式，需上线。</p>
 <p>✅ 最后的 F1 公式已配置化；中间 C++ 因子、DSL 也有零散配置；表达能力等价原 C++。<br/>❌ <b>配置没有统一收口</b>：散在 C++ / DSL / F1 三处，代码分散难找，因子能否复用没人知道。<br/><span class="src">证据：common_se_defs.h:145 FINISH_ADMIT、:164 FINISH_COMPUTE</span></p></div>
 
-<div class="card"><h3>方案二 C++ 前处理 + F1 + C++ 后处理</h3>
-<div class="mermaid">flowchart LR
-A["C++ 前处理（冷，不涉及配置）"] --> B["F1 公式（热，全部配置）"] --> C["C++ 后处理（冷，不涉及配置）"]</div>
-<p>方案一配置分散痛点的升级：热内容放 F1；很少迭代的放前/后处理 C++，不涉及配置。</p>
-<p>✅ 热内容在 F1 收口。<br/>❌ 把本来业务聚集的代码按阶段拆分，方案代价不合理（例：PC 置换须在主公式后、AUC 在中间、top61 在两轮之间，同一业务被切到多段）。</p></div>
-
-<div class="card"><h3>方案三 KaiFG + F1</h3>
+<div class="card"><h3>方案二 KaiFG + F1</h3>
 <div class="mermaid">flowchart LR
 K["KaiFG 因子（复杂逻辑，DSL）"] --> D["DSL 聚合"]
 F["F1 公式（热代码，配置）"] --> D --> W["写回"]</div>
 <p>KaiFG 只需 DSL，F1 是配置，两者通过 DSL 聚合；热代码走 F1，复杂逻辑走 KaiFG；全程只有 DSL 和配置。</p>
 <p>✅ 不写 C++；表达力足够。<br/>❌ 仍是“因子 + 公式”的抽象；因子迭代不是配置化，还要上线。<br/><span class="src">证据：KaiFG 编译加载为进程级 call_once（kaifg_client.cc:393-411），不支持热更。</span></p></div>
 
-<div class="card"><h3>方案四 全量 F1（复杂逻辑用 UDF）</h3>
+<div class="card"><h3>方案三 全量 F1 + UDF</h3>
 <div class="mermaid">flowchart LR
 I["common（含AB）+ item"] --> F["多种 F1 公式组合<br/>全量走配置文件"]
 U["UDF（C++）：因子等复杂逻辑"] --> F --> O["配置声明的输出 → 写回"]</div>
@@ -74,14 +68,14 @@ U["UDF（C++）：因子等复杂逻辑"] --> F --> O["配置声明的输出 →
 <tr><td>op_statistics 统计</td><td>3575、6915-6947</td><td>未核</td><td>可能用已有列归约</td></tr></table></div>
 
 <h2>4. 对比矩阵（围绕：热内容配置化 + 统一收口）</h2>
-<table><tr><th>维度</th><th>一 外流</th><th>二 前/F1/后</th><th>三 KaiFG+F1</th><th>四 全量 F1</th></tr>
-<tr><td>热内容配置化</td><td>部分（F1 + 零散）</td><td>✓（F1）</td><td>公式✓ / 因子✗</td><td>✓</td></tr>
-<tr><td>统一收口</td><td>✗ 三处分散</td><td>✓ F1</td><td>✗ DSL+配置两处</td><td>✓ 配置文件</td></tr>
-<tr><td>冷代码去向</td><td>C++ 因子</td><td>前/后处理 C++</td><td>KaiFG</td><td>UDF（C++）</td></tr>
-<tr><td>新增因子需上线</td><td>是</td><td>落在冷段时是</td><td>是</td><td>仅新增 UDF 时</td></tr>
-<tr><td>主要代价</td><td>分散难找</td><td>业务代码按阶段拆</td><td>因子仍上线</td><td>配置管理 / UDF 开发 / F1 注册需求</td></tr></table>
+<table><tr><th>维度</th><th>一 外流小算子</th><th>二 KaiFG+F1</th><th>三 全量 F1+UDF</th></tr>
+<tr><td>热内容配置化</td><td>部分（F1 + 零散）</td><td>公式✓ / 因子✗</td><td>✓</td></tr>
+<tr><td>统一收口</td><td>✗ 三处分散</td><td>✗ DSL+配置两处</td><td>✓ 配置文件</td></tr>
+<tr><td>冷代码去向</td><td>C++ 因子</td><td>KaiFG</td><td>UDF（C++）</td></tr>
+<tr><td>新增因子需上线</td><td>是</td><td>是</td><td>仅新增 UDF 时</td></tr>
+<tr><td>主要代价</td><td>分散难找</td><td>因子仍上线</td><td>配置管理 / UDF 开发 / F1 注册需求</td></tr></table>
 
-<h2>5. 方案四目标结构（草案）</h2>
+<h2>5. 方案三目标结构（草案）</h2>
 <div class="mermaid">
 flowchart TB
 subgraph CFG["配置编译路径（管理面）"]
@@ -118,7 +112,12 @@ VER -. 请求固定版本 .-> F1
 </ol>
 
 <h2>附录：历史方案（已撤回，非当前）</h2>
-<ul><li>张量扩展 F1（gather/scatter/argsort_legacy/scan/call）：向用户暴露底层协议、扩展无止境，已撤回。</li>
+<ul><li><b>已下掉：C++前处理+F1+C++后处理</b>。该方案假设热内容只在纯标量公式里，经源码核对不成立，结论是"二不如一"：表达能力和方案一相同，热常数仍留在 C++，还要按阶段拆开业务代码并多次来回编排。证据：
+<ul><li>LTR 6775-6779：<code>ltr_alpha_constant *= 0.3/0.5</code> 写在成员变量里，跨 item 生效；6783 起的档位表（8/10/12…）属热常数</li>
+<li>促搜 6231-6348：全队列 min/max → 档位常数 if 链 → 游戏意图置 0 → log 加分，都在同一个因子内</li>
+<li>op_statistics 6910-6950：map 查找加 size 检查，后接含 3.0f/0.90f 常数的 float 公式</li>
+<li>PC 收集 5380-5403：在循环内按版本/时长/开关收集 pair，排序在 8302-8342；每轮至少 4-5 次 C++/F1 交替</li></ul></li>
+<li>张量扩展 F1（gather/scatter/argsort_legacy/scan/call）：向用户暴露底层协议、扩展无止境，已撤回。</li>
 <li>YAML 自动拆 KaiFG+F1 并热更：KaiFG call_once 无法热更，放弃。</li>
 <li>Python→C++ 源码生成：需自建编译器，暂不推进。</li></ul>
 <script>mermaid.initialize({startOnLoad:true,securityLevel:'loose',flowchart:{htmlLabels:true}});</script>
