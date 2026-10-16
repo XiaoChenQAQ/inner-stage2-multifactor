@@ -1,0 +1,133 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>内流二阶段多因子引擎 方案对比（结构稿）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+body{font-family:-apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif;max-width:1180px;margin:0 auto;padding:24px;color:#222;line-height:1.6}
+h1{border-bottom:2px solid #333}h2{margin-top:40px;border-left:5px solid #3b6;padding-left:8px}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #ccc;padding:6px;vertical-align:top}th{background:#f3f3f3}
+.card{border:1px solid #ddd;border-radius:6px;padding:12px 16px;margin:16px 0}.src{font-size:12px;color:#666}
+.tag{display:inline-block;padding:0 6px;border-radius:3px;font-size:12px}.done{background:#d6f5d6}.todo{background:#ffe3b3}.risk{background:#fdd}
+.mermaid{background:#fafafa;padding:8px}code{background:#f2f2f2;padding:0 3px}
+</style></head><body>
+<h1>内流二阶段多因子引擎：方案路径与对比（结构稿，待确认后美化）</h1>
+<p>核心目标：<b>未来迭代只改配置，尽量不动 C++</b>；同时保持旧链路数据流、数值、顺序等价。<span class="src">行号均指 feat/inner-stage2-yaml 当前分支 innerstream_final_adjust_new.cc，除非另注。</span></p>
+
+<h2>1. 目标与评估维度</h2>
+<table><tr><th>维度</th><th>含义</th></tr>
+<tr><td>只改配置</td><td>新增特征/因子、改公式时是否只动配置</td></tr>
+<tr><td>表达能力</td><td>能否覆盖 PC 置换、AUC、top61、跨 item carry、float32 等 C++ 语义</td></tr>
+<tr><td>配置化与收口</td><td>公式是否统一在唯一配置系统，而非散落 C++/DSL/公式</td></tr>
+<tr><td>上线节奏</td><td>改公式是否需 Parent 编译上线</td></tr>
+<tr><td>冷热分离</td><td>稳定算法（冷）与常改公式/参数（热）是否分开</td></tr>
+<tr><td>数值等价</td><td>能否逐位保持旧 float/double 转换与舍入（目标，<span class="tag risk">未验证</span>）</td></tr>
+<tr><td>依赖外部团队</td><td>是否需 F1 / KaiFG 团队改动</td></tr></table>
+
+<h2>2. 现有链路（假设 inner_down_previous_logic=4，默认 calculate_finalscore）</h2>
+<div class="mermaid">
+flowchart TD
+G["GroupPK：队列选择+特征回填，跳过旧分排序/截断<br/>inner_group_pk_tuner.cc:136-226"] --> E["EnrichInternal 主流程 10665-10728"]
+E --> N["PXTR min/max 归一化"]
+N --> EM["EMER 同步 RPC：CallInnerEmer→Recommend 等待返回<br/>写 inner_emer_score 11133-11282"]
+EM --> F["候选过滤"] --> B["InflowAdjust_boost：外部输入/参数/队列统计"]
+B --> X1["① calculate_finalscore 3029→3033-8835"]
+subgraph CF["calculate_finalscore 内部"]
+P["请求准备 3033-3773<br/>参数词典 1621-1681 / Redis 2667-2748,3383-3411<br/>op_statistics 3575"] --> L["item 循环 3775-8290<br/>8log→相关性→促搜6195-6485→互动6701-7675<br/>LTR carry 6775-6779,6992,8002<br/>POI/后播/电商/LTR 7676-7872→重算7873-8066"]
+L --> W["写回 SetDoubleAttr final_score 8224-8291"]
+W --> PC["PC 双排序分数置换 v1 8302-8318 / v2 8326-8342"]
+PC --> AU["STD/AUC 重排 helper 2796-2849 调用8356"]
+AU --> EF["EMER replace/fusion 8448-8595"] --> RP["相关性保护/排序 8596-8835"]
+end
+X1 --> P
+RP --> S1["全队列排序→refer 打零→再排序"]
+S1 --> C{"once 开关且实时类型? 10078-10136"}
+C -- 是 --> T["top61 统计（纯统计非Redis）9918-10009"] --> X2["② calculate_finalscore 完整重跑"] --> S2["排序"]
+C -- 否 --> PS
+S2 --> PS["后续策略：版权干预→监控"]
+</div>
+
+<h2>3. 五个方案</h2>
+
+<div class="card"><h3>方案一 外流（已有做法）：C++ 因子 + DSL 拼装 + F1 公式</h3>
+<div class="mermaid">flowchart LR
+A["5000行 finalscore"] --> B["拆成多个 C++ 因子<br/>admit/compute，可嵌套 factor udf"] --> C["DSL 小算子拼大算子"] --> D["F1 最终公式（纯math）"]</div>
+<p><b>加一个因子要改：</b>C++ 因子类 + 注册 + DSL 接线 + 公式（3~4 处，需上线）。</p>
+<p>✅ 分而治之、表达能力等价原 C++、阶段明确（因子C++ + 公式math）、成功拆文件。<br/>❌ 基本没配置化；代码分散难找；因子能否复用没人知道；加一个乘法代码量大。<br/><span class="src">证据：common_se_defs.h:145 FINISH_ADMIT、:164 FINISH_COMPUTE（会话核对）</span></p></div>
+
+<div class="card"><h3>方案二 C++ 前处理 + F1 + C++ 后处理</h3>
+<div class="mermaid">flowchart LR
+A["C++ 前处理<br/>字典/名单/有序参数"] --> B["F1 主公式"] --> C["C++ 中间：PC置换/AUC"] --> D["F1 依据摘要调分"] --> E["C++ 保护/排序/写回"] --> F["两轮间 top61 → 第二轮"]</div>
+<p><b>改公式：</b>若在 F1 段只改配置；若落在 C++ 段需改 C++ 上线。</p>
+<p>✅ 折衷可行，类似外流 finaladjust bonus 阶段；不改公共 F1 库。<br/>❌ 因子计算阶段也有变量和公式，口子一开，大量公式最终仍留在 C++；须按依赖切段（PC 在主公式后、AUC 居中、top61 在两轮间）；数值问题仍在。</p></div>
+
+<div class="card"><h3>方案三 KaiFG + F1</h3>
+<div class="mermaid">flowchart LR
+A["KaiFG Python 程序<br/>（编译成 .so）"] --> C["DSL 编排"]
+B["F1 公式配置"] --> C --> D["Dragon 写回"]</div>
+<p><b>改复杂逻辑：</b>改 Python → 重编 .so → 上线；改简单公式：F1 配置。</p>
+<p>✅ 表达力等价 C++（v3 支持 lambda/sort(key)/NumPy）。<br/>❌ 不是配置化，逻辑上与方案二相同，只是 C++ 换成 Python；公式未统一收口；升级仍需上线。<br/><span class="src">证据：KaiFG 进程级单例 + call_once 编译加载 kaifg_client.cc:393-411，无同进程热更；整包编译会影响其他节点。</span></p></div>
+
+<div class="card"><h3>方案四 纯 F1 + 注册 UDF（用户倾向）</h3>
+<div class="mermaid">flowchart LR
+I["common（含AB）+ item 属性"] --> F["F1 公式（多份配置，唯一配置系统）"]
+U["业务 UDF（C++，编译链接时注册）<br/>PC_REASSIGN / AUC / top61 ..."] --> F
+F --> O["配置声明的输出 → 写回"]</div>
+<p><b>改因子/公式：</b>只改 F1 配置；中间因子变量支持参数注入。仅新增一种稳定算法时才写 UDF 上线（低频）。</p>
+<p>✅ 公式只关心 common/item 数值运算；UDF 可操作输入 common/item 属性，能做的计算与 KaiFG/C++ 无差异；特殊逻辑迭代少（git：PC/AUC 近90天未改、top61 自2025-11未改）；统一收口。<br/>❌ F1 注册 UDF 目前不是插接式（集中注册 f1_udf_collection.h:558），需向 F1 团队提需求；UDF 拿到的是 F1Context（值导入的数据），非 DragonContext；多输出/跨 item 状态需额外设计（LTR 2026-10-09 刚改，状态规则不宜固化 C++）；float32 逐位一致未解决。</p></div>
+
+<div class="card"><h3>方案五 参考 Aether：纯 Python 即配置，编译出 KaiFG + DSL + F1</h3>
+<div class="mermaid">flowchart LR
+P["用户 Python 文件<br/>只声明 输入common/item、AB、中间变量、输出"] --> C["编译器"] --> K["KaiFG"] & D["DSL"] & F["F1 公式"] --> R["Parent 上线"]</div>
+<p>✅ 解决方案三“用户感知到不需要的技术细节”；Python 文件即配置。<br/>❌ 仍需编译上线，Parent 上线慢，非快速迭代；公式冷热未分离；需自建编译器。</p></div>
+
+<h2>4. 对比矩阵</h2>
+<table><tr><th>维度</th><th>一 外流</th><th>二 前/F1/后</th><th>三 KaiFG+F1</th><th>四 F1+UDF</th><th>五 Aether式</th></tr>
+<tr><td>只改配置</td><td>✗</td><td>部分</td><td>部分</td><td>✓（常改部分）</td><td>✗（需上线）</td></tr>
+<tr><td>表达能力</td><td>等价C++</td><td>等价C++</td><td>等价C++</td><td>等价（经UDF）</td><td>等价</td></tr>
+<tr><td>收口</td><td>✗ 分散</td><td>✗ 易回流C++</td><td>✗</td><td>✓ 唯一配置</td><td>✓ 单Python</td></tr>
+<tr><td>上线节奏</td><td>每次上线</td><td>C++段上线</td><td>Python段上线</td><td>仅新增UDF上线</td><td>每次上线</td></tr>
+<tr><td>冷热分离</td><td>✗</td><td>部分</td><td>部分</td><td>✓ UDF冷/公式热</td><td>✗</td></tr>
+<tr><td>数值等价</td><td>原C++</td><td>F1段待补f32</td><td>KaiFG f32无保证</td><td>F1待补f32</td><td>取决于后端</td></tr>
+<tr><td>外部依赖</td><td>无</td><td>无</td><td>KaiFG</td><td>F1团队（注册注入）</td><td>KaiFG+自建编译器</td></tr>
+<tr><td>可行性/便利</td><td>已有</td><td>较合理</td><td>较合理</td><td><b>较合理·倾向</b></td><td>成本高</td></tr></table>
+
+<h2>5. 推荐方向（方案四）目标结构</h2>
+<div class="mermaid">
+flowchart TB
+subgraph CFG["配置编译路径（管理面）"]
+Y["YAML（近Python）：输入/AB/因子/公式/输出/状态"] --> TR["翻译器：类型检查/SSA/惰性分支/依赖/自动绑定<br/>stage2_compiler.py 标量部分 已实现"]
+TR --> FJ["F1 配置 JSON（KConf 更新重编 executor formula1.cc:25-50）"]
+UDF["业务 UDF（C++，随 Parent 编译链接）待扩展"] --> REG["F1 实例级 UDF 工厂注入 待F1团队<br/>F1Executor 自带 UdfCollection f1_executor.h:150"]
+FJ --> VER["完整策略版本（入口 AB 选整组）待扩展"]
+REG --> VER
+end
+subgraph REQ["请求执行路径（数据面）"]
+D0["GroupPK"] --> D1["数据准备/外部读取（C++宿主）<br/>参数词典/Redis/名单"]
+D1 --> EMS["EMER：现状同步等待；目标异步发起-并行-等待"]
+D1 --> IMP["值导入 common/item/AB → F1Context<br/>common_reco_formula1_enricher.cc:229,289"]
+IMP --> F1["F1 公式 + UDF（F1Context≠DragonContext）<br/>内部 sort/RANK 仅改值不改队列<br/>有序执行器传 carry 待扩展"]
+EMS --> F1
+F1 --> WB["按位写回声明输出 SetDoubleItemAttr :398"]
+WB --> SORT["Dragon 真实列表重排（流程层）"]
+SORT --> R2["[条件] top61 → 第二轮"] --> PS["后续策略"]
+end
+VER -. 请求固定版本 .-> F1
+</div>
+<table><tr><th>状态</th><th>项</th></tr>
+<tr><td><span class="tag done">已实现 MR410</span></td><td>InnerStage2FormulaEnricher 局部迁移+开关回退（inner_stage2_formula_enricher.cc:80-97）；25 个 F1 program / YAML 807 行；注册表自动生成 getter/写回；原语数值单测（58 case，5 处差异）；误差累积实验</td></tr>
+<tr><td><span class="tag todo">待扩展</span></td><td>typed float32/int 运算；多输出/状态绑定与有序执行器；PC/AUC/top61 UDF；F1 注册注入；翻译器 Python 子集；整组版本与 AB 路由；EMER 异步；后播完整源图；构建与真实请求双跑</td></tr></table>
+<p class="src">F1 引擎 v2 只读 getter（common_reco_formula1_enricher.cc:694）≠ 业务二阶段 v2；线上未确认启用。</p>
+
+<h2>6. 风险与待决问题</h2>
+<ol>
+<li><b>F1 注册注入需求</b>：实例级工厂、配置重载保留注册（formula1.cc:34）、重名报错、是否提供求值时上下文绑定。</li>
+<li><b>多输出/状态</b>：UDF 返回 double/缓存整列；分数+order+状态的绑定；LTR carry 用通用执行器还是前置参数序列。</li>
+<li><b>float32 逐位一致未验证</b>：原语单测已见 float 转换、int 除法、-0 符号差异；近分时排序可翻转。</li>
+<li><b>AB 整组版本</b>：入口选配置集 + 公式内 AB 条件；请求固定版本、旧版本生命周期。</li>
+<li>EMER 是否改异步；后续策略/GroupPK 是否接入同一引擎；epsilon 比较器非严格弱序。</li>
+</ol>
+
+<h2>附录：历史方案（已撤回，非当前）</h2>
+<ul><li>张量扩展 F1（gather/scatter/argsort_legacy/scan/call）：向用户暴露底层协议、扩展无止境，已撤回。</li>
+<li>YAML 自动拆 KaiFG+F1 并热更：KaiFG call_once 无法热更，放弃。</li>
+<li>Python→C++ 源码生成：需自建编译器，暂不推进。</li></ul>
+<script>mermaid.initialize({startOnLoad:true,securityLevel:'loose',flowchart:{htmlLabels:true}});</script>
+</body></html>
