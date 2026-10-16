@@ -9,19 +9,12 @@ table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid 
 .mermaid{background:#fafafa;padding:8px}code{background:#f2f2f2;padding:0 3px}
 </style></head><body>
 <h1>内流二阶段多因子引擎：方案路径与对比（结构稿，待确认后美化）</h1>
-<p>核心目标：<b>未来迭代只改配置，尽量不动 C++</b>；同时保持旧链路数据流、数值、顺序等价。<span class="src">行号均指 feat/inner-stage2-yaml 当前分支 innerstream_final_adjust_new.cc，除非另注。</span></p>
-
-<h2>1. 目标与评估维度</h2>
-<table><tr><th>维度</th><th>含义</th></tr>
-<tr><td>只改配置</td><td>新增特征/因子、改公式时是否只动配置</td></tr>
-<tr><td>表达能力</td><td>能否覆盖 PC 置换、AUC、top61、跨 item carry、float32 等 C++ 语义</td></tr>
-<tr><td>配置化与收口</td><td>公式是否统一在唯一配置系统，而非散落 C++/DSL/公式</td></tr>
-<tr><td>上线节奏</td><td>改公式是否需 Parent 编译上线</td></tr>
-<tr><td>冷热分离</td><td>稳定算法（冷）与常改公式/参数（热）是否分开</td></tr>
-<tr><td>数值等价</td><td>能否逐位保持旧 float/double 转换与舍入（目标，<span class="tag risk">未验证</span>）</td></tr>
-<tr><td>依赖外部团队</td><td>是否需 F1 / KaiFG 团队改动</td></tr></table>
-
-<h2>2. 现有链路（假设 inner_down_previous_logic=4，默认 calculate_finalscore）</h2>
+<h2>1. 目标：配置化（冷热分流）</h2>
+<table><tr><th>类别</th><th>内容</th><th>处理</th></tr>
+<tr><td><b>热</b>（频繁更新）</td><td>新增因子、修改公式权重、因子内部的常数权重等</td><td><b>配置化，统一收口</b></td></tr>
+<tr><td><b>冷</b>（很少迭代）</td><td>很细粒度、稳定的代码（如特殊排序/置换/统计算法）</td><td>不必配置化</td></tr></table>
+<p class="src">约束（不是目标）：迁移保持旧链路数据流、数值、顺序等价；float/double 逐位一致尚未验证。</p>
+<h2>2. 现有链路（多因子一阶段已下线）</h2>
 <div class="mermaid">
 flowchart TD
 G["GroupPK：队列选择+特征回填，跳过旧分排序/截断<br/>inner_group_pk_tuner.cc:136-226"] --> E["EnrichInternal 主流程 10665-10728"]
@@ -44,52 +37,51 @@ C -- 否 --> PS
 S2 --> PS["后续策略：版权干预→监控"]
 </div>
 
-<h2>3. 五个方案</h2>
-
+<h2>3. 四个方案</h2>
 <div class="card"><h3>方案一 外流（已有做法）：C++ 因子 + DSL 拼装 + F1 公式</h3>
 <div class="mermaid">flowchart LR
-A["5000行 finalscore"] --> B["拆成多个 C++ 因子<br/>admit/compute，可嵌套 factor udf"] --> C["DSL 小算子拼大算子"] --> D["F1 最终公式（纯math）"]</div>
-<p><b>加一个因子要改：</b>C++ 因子类 + 注册 + DSL 接线 + 公式（3~4 处，需上线）。</p>
-<p>✅ 分而治之、表达能力等价原 C++、阶段明确（因子C++ + 公式math）、成功拆文件。<br/>❌ 基本没配置化；代码分散难找；因子能否复用没人知道；加一个乘法代码量大。<br/><span class="src">证据：common_se_defs.h:145 FINISH_ADMIT、:164 FINISH_COMPUTE（会话核对）</span></p></div>
+A["5000行 finalscore"] --> B["多个 C++ 因子（admit/compute，可嵌套 factor udf）<br/>零散配置"] --> C["DSL 小算子拼大算子<br/>零散配置"] --> D["F1 最终公式（配置化）"]</div>
+<p><b>加一个因子要改：</b>C++ 因子 + DSL + 公式，需上线。</p>
+<p>✅ 最后的 F1 公式已配置化；中间 C++ 因子、DSL 也有零散配置；表达能力等价原 C++。<br/>❌ <b>配置没有统一收口</b>：散在 C++ / DSL / F1 三处，代码分散难找，因子能否复用没人知道。<br/><span class="src">证据：common_se_defs.h:145 FINISH_ADMIT、:164 FINISH_COMPUTE</span></p></div>
 
 <div class="card"><h3>方案二 C++ 前处理 + F1 + C++ 后处理</h3>
 <div class="mermaid">flowchart LR
-A["C++ 前处理<br/>字典/名单/有序参数"] --> B["F1 主公式"] --> C["C++ 中间：PC置换/AUC"] --> D["F1 依据摘要调分"] --> E["C++ 保护/排序/写回"] --> F["两轮间 top61 → 第二轮"]</div>
-<p><b>改公式：</b>若在 F1 段只改配置；若落在 C++ 段需改 C++ 上线。</p>
-<p>✅ 折衷可行，类似外流 finaladjust bonus 阶段；不改公共 F1 库。<br/>❌ 因子计算阶段也有变量和公式，口子一开，大量公式最终仍留在 C++；须按依赖切段（PC 在主公式后、AUC 居中、top61 在两轮间）；数值问题仍在。</p></div>
+A["C++ 前处理（冷，不涉及配置）"] --> B["F1 公式（热，全部配置）"] --> C["C++ 后处理（冷，不涉及配置）"]</div>
+<p>方案一配置分散痛点的升级：热内容放 F1；很少迭代的放前/后处理 C++，不涉及配置。</p>
+<p>✅ 热内容在 F1 收口。<br/>❌ 把本来业务聚集的代码按阶段拆分，方案代价不合理（例：PC 置换须在主公式后、AUC 在中间、top61 在两轮之间，同一业务被切到多段）。</p></div>
 
 <div class="card"><h3>方案三 KaiFG + F1</h3>
 <div class="mermaid">flowchart LR
-A["KaiFG Python 程序<br/>（编译成 .so）"] --> C["DSL 编排"]
-B["F1 公式配置"] --> C --> D["Dragon 写回"]</div>
-<p><b>改复杂逻辑：</b>改 Python → 重编 .so → 上线；改简单公式：F1 配置。</p>
-<p>✅ 表达力等价 C++（v3 支持 lambda/sort(key)/NumPy）。<br/>❌ 不是配置化，逻辑上与方案二相同，只是 C++ 换成 Python；公式未统一收口；升级仍需上线。<br/><span class="src">证据：KaiFG 进程级单例 + call_once 编译加载 kaifg_client.cc:393-411，无同进程热更；整包编译会影响其他节点。</span></p></div>
+K["KaiFG 因子（复杂逻辑，DSL）"] --> D["DSL 聚合"]
+F["F1 公式（热代码，配置）"] --> D --> W["写回"]</div>
+<p>KaiFG 只需 DSL，F1 是配置，两者通过 DSL 聚合；热代码走 F1，复杂逻辑走 KaiFG；全程只有 DSL 和配置。</p>
+<p>✅ 不写 C++；表达力足够。<br/>❌ 仍是“因子 + 公式”的抽象；因子迭代不是配置化，还要上线。<br/><span class="src">证据：KaiFG 编译加载为进程级 call_once（kaifg_client.cc:393-411），不支持热更。</span></p></div>
 
-<div class="card"><h3>方案四 纯 F1 + 注册 UDF（用户倾向）</h3>
+<div class="card"><h3>方案四 全量 F1（复杂逻辑用 UDF）</h3>
 <div class="mermaid">flowchart LR
-I["common（含AB）+ item 属性"] --> F["F1 公式（多份配置，唯一配置系统）"]
-U["业务 UDF（C++，编译链接时注册）<br/>PC_REASSIGN / AUC / top61 ..."] --> F
-F --> O["配置声明的输出 → 写回"]</div>
-<p><b>改因子/公式：</b>只改 F1 配置；中间因子变量支持参数注入。仅新增一种稳定算法时才写 UDF 上线（低频）。</p>
-<p>✅ 公式只关心 common/item 数值运算；UDF 可操作输入 common/item 属性，能做的计算与 KaiFG/C++ 无差异；特殊逻辑迭代少（git：PC/AUC 近90天未改、top61 自2025-11未改）；统一收口。<br/>❌ F1 注册 UDF 目前不是插接式（集中注册 f1_udf_collection.h:558），需向 F1 团队提需求；UDF 拿到的是 F1Context（值导入的数据），非 DragonContext；多输出/跨 item 状态需额外设计（LTR 2026-10-09 刚改，状态规则不宜固化 C++）；float32 逐位一致未解决。</p></div>
+I["common（含AB）+ item"] --> F["多种 F1 公式组合<br/>全量走配置文件"]
+U["UDF（C++）：因子等复杂逻辑"] --> F --> O["配置声明的输出 → 写回"]</div>
+<p>因子等复杂逻辑用 UDF，整体转化成多种 F1 公式组合，全量走配置文件。</p>
+<p>✅ 热内容全部配置、统一收口。<br/>❓ <b>待讨论</b>：</p>
+<ol><li>配置文件怎么管理？</li><li>UDF 用起来也是开发 C++。</li><li>真实需要 UDF 的数量多吗？</li><li>能不能复用？</li></ol>
+<p>另：F1 注册 UDF 目前是集中注册，不是插接式（f1_udf_collection.h:558），需向 F1 团队提需求。</p>
+<table><tr><th colspan="4">UDF 候选清单（<span class="tag todo">初步、待核实</span>）</th></tr>
+<tr><th>候选</th><th>源码位置</th><th>迭代情况（git）</th><th>备注</th></tr>
+<tr><td>PC 双排序分数置换</td><td>收集 5380-5403；v1 8302-8318 / v2 8326-8342</td><td>近 90 天未改</td><td>v2 读 v1 结果</td></tr>
+<tr><td>AUC（排序+pairwise）</td><td>helper 2796-2849，调用 8356</td><td>近 90 天未改</td><td>保留 *2/cnt、n≤1 默认</td></tr>
+<tr><td>top61 样本统计</td><td>9918-10009，helper 2509-2522</td><td>2025-11 加入后未改</td><td>两轮之间</td></tr>
+<tr><td>LTR/FTR 跨 item 状态</td><td>6775-6779、6992、8002</td><td>LTR 2026-10-09 刚改</td><td>规则常改，不宜整体做 UDF；可能需通用有序执行</td></tr>
+<tr><td>op_statistics 统计</td><td>3575、6915-6947</td><td>未核</td><td>可能用已有列归约</td></tr></table></div>
 
-<div class="card"><h3>方案五 参考 Aether：纯 Python 即配置，编译出 KaiFG + DSL + F1</h3>
-<div class="mermaid">flowchart LR
-P["用户 Python 文件<br/>只声明 输入common/item、AB、中间变量、输出"] --> C["编译器"] --> K["KaiFG"] & D["DSL"] & F["F1 公式"] --> R["Parent 上线"]</div>
-<p>✅ 解决方案三“用户感知到不需要的技术细节”；Python 文件即配置。<br/>❌ 仍需编译上线，Parent 上线慢，非快速迭代；公式冷热未分离；需自建编译器。</p></div>
+<h2>4. 对比矩阵（围绕：热内容配置化 + 统一收口）</h2>
+<table><tr><th>维度</th><th>一 外流</th><th>二 前/F1/后</th><th>三 KaiFG+F1</th><th>四 全量 F1</th></tr>
+<tr><td>热内容配置化</td><td>部分（F1 + 零散）</td><td>✓（F1）</td><td>公式✓ / 因子✗</td><td>✓</td></tr>
+<tr><td>统一收口</td><td>✗ 三处分散</td><td>✓ F1</td><td>✗ DSL+配置两处</td><td>✓ 配置文件</td></tr>
+<tr><td>冷代码去向</td><td>C++ 因子</td><td>前/后处理 C++</td><td>KaiFG</td><td>UDF（C++）</td></tr>
+<tr><td>新增因子需上线</td><td>是</td><td>落在冷段时是</td><td>是</td><td>仅新增 UDF 时</td></tr>
+<tr><td>主要代价</td><td>分散难找</td><td>业务代码按阶段拆</td><td>因子仍上线</td><td>配置管理 / UDF 开发 / F1 注册需求</td></tr></table>
 
-<h2>4. 对比矩阵</h2>
-<table><tr><th>维度</th><th>一 外流</th><th>二 前/F1/后</th><th>三 KaiFG+F1</th><th>四 F1+UDF</th><th>五 Aether式</th></tr>
-<tr><td>只改配置</td><td>✗</td><td>部分</td><td>部分</td><td>✓（常改部分）</td><td>✗（需上线）</td></tr>
-<tr><td>表达能力</td><td>等价C++</td><td>等价C++</td><td>等价C++</td><td>等价（经UDF）</td><td>等价</td></tr>
-<tr><td>收口</td><td>✗ 分散</td><td>✗ 易回流C++</td><td>✗</td><td>✓ 唯一配置</td><td>✓ 单Python</td></tr>
-<tr><td>上线节奏</td><td>每次上线</td><td>C++段上线</td><td>Python段上线</td><td>仅新增UDF上线</td><td>每次上线</td></tr>
-<tr><td>冷热分离</td><td>✗</td><td>部分</td><td>部分</td><td>✓ UDF冷/公式热</td><td>✗</td></tr>
-<tr><td>数值等价</td><td>原C++</td><td>F1段待补f32</td><td>KaiFG f32无保证</td><td>F1待补f32</td><td>取决于后端</td></tr>
-<tr><td>外部依赖</td><td>无</td><td>无</td><td>KaiFG</td><td>F1团队（注册注入）</td><td>KaiFG+自建编译器</td></tr>
-<tr><td>可行性/便利</td><td>已有</td><td>较合理</td><td>较合理</td><td><b>较合理·倾向</b></td><td>成本高</td></tr></table>
-
-<h2>5. 推荐方向（方案四）目标结构</h2>
+<h2>5. 方案四目标结构（草案）</h2>
 <div class="mermaid">
 flowchart TB
 subgraph CFG["配置编译路径（管理面）"]
